@@ -9,5 +9,7 @@ public enum SubmitStatus {
     /** 幂等键相同但内容冲突，必须拒绝 */
     CONFLICT,
     /** 积压超限，按策略拒绝 */
-    OVERLOAD
+    OVERLOAD,
+    /** 目标聚合被暂停/阻塞且其排队积压已达上限，按策略拒绝或推迟 */
+    AGGREGATE_FULL
 }

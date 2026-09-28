@@ -12,4 +12,9 @@ public class AuditLog {
     public void record(String tenantId, String eventId, String action, String detail) {
         log.info("audit tenant={} event={} action={} detail={}", tenantId, eventId, action, detail);
     }
+
+    /** 聚合闸门动作审计：只记录租户、聚合键与动作，不记录任何凭据 */
+    public void recordGate(String tenantId, String aggregateKey, String action, String detail) {
+        log.info("audit tenant={} aggregate={} action={} detail={}", tenantId, aggregateKey, action, detail);
+    }
 }

@@ -10,8 +10,15 @@ import java.util.Optional;
 /** 事件本地持久化存储。所有方法需线程安全；状态变更需落盘以便重启恢复。 */
 public interface EventStore {
 
+    /** 幂等提交（容量按 {@link SubmitOptions} 约束） */
+    default SubmitResult submit(DeliveryEvent event, SubmitOptions options) {
+        throw new UnsupportedOperationException();
+    }
+
     /** 幂等提交：同租户同幂等键内容一致返回 DUPLICATE，冲突返回 CONFLICT，超限返回 OVERLOAD */
-    SubmitResult submit(DeliveryEvent event, int maxPending);
+    default SubmitResult submit(DeliveryEvent event, int maxPending) {
+        throw new UnsupportedOperationException();
+    }
 
     Optional<DeliveryEvent> findById(String tenantId, String id);
 
@@ -19,7 +26,8 @@ public interface EventStore {
 
     /**
      * 原子认领一批可投递事件：PENDING 或到期的 RETRY_WAIT，或租约已过期的 LEASED（租约回收）。
-     * 同一聚合键只允许顺序最前的未投递事件被认领，保证顺序。
+     * 同一聚合键只允许顺序最前的未完成事件被认领；FAILED 队首（除非被重放）与人工暂停的聚合
+     * 都不放行，从而保证顺序并实现“阻塞聚合后续事件排队”。
      */
     List<DeliveryEvent> claimDeliverable(String workerId, int max, Duration leaseDuration);
 
@@ -36,4 +44,26 @@ public interface EventStore {
     boolean replay(String tenantId, String id);
 
     int countPending();
+
+    // ---- 聚合闸门 ----
+
+    /** 暂停某聚合：已在投递的事件继续完成，之后该聚合不再被认领；返回 false 表示已处于暂停 */
+    default boolean pauseGate(String tenantId, String aggregateKey) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** 恢复某聚合：从暂停位置按原顺序继续投递；返回 false 表示此前并未暂停 */
+    default boolean resumeGate(String tenantId, String aggregateKey) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** 查询单个聚合的闸门状态；无事件也未暂停过的聚合返回 empty */
+    default Optional<GateView> findGate(String tenantId, String aggregateKey, int backlogLimit) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** 列出租户内所有存在排队事件或被暂停的聚合闸门，可按状态过滤（state 为 null 表示全部） */
+    default List<GateView> listGates(String tenantId, String state, int backlogLimit) {
+        throw new UnsupportedOperationException();
+    }
 }

@@ -6,10 +6,13 @@ import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventRequ
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventResponse;
 import com.github.highcumontoa.reliableeventdeliveryjava.audit.AuditLog;
 import com.github.highcumontoa.reliableeventdeliveryjava.config.DeliveryProperties;
+import com.github.highcumontoa.reliableeventdeliveryjava.config.GateOverflowPolicy;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.DeliveryEvent;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.ErrorCode;
 import com.github.highcumontoa.reliableeventdeliveryjava.store.EventStore;
+import com.github.highcumontoa.reliableeventdeliveryjava.store.SubmitOptions;
 import com.github.highcumontoa.reliableeventdeliveryjava.store.SubmitResult;
+import com.github.highcumontoa.reliableeventdeliveryjava.store.SubmitStatus;
 import java.util.List;
 import org.springframework.stereotype.Service;
 
@@ -36,7 +39,13 @@ public class EventService {
         event.setPayload(request.payload());
         event.setTargetUrl(request.targetUrl());
 
-        SubmitResult result = store.submit(event, properties.getMaxPending());
+        SubmitOptions options = new SubmitOptions(properties.getMaxPending(), properties.getGateMaxBacklog());
+        SubmitResult result = store.submit(event, options);
+        // DEFER：聚合闸门排队到顶时在限定时间内等队首被处理而腾出位置，超时仍满则按拒绝处理
+        if (result.status() == SubmitStatus.AGGREGATE_FULL
+                && properties.getGateOverflowPolicy() == GateOverflowPolicy.DEFER) {
+            result = deferSubmit(event, options);
+        }
         switch (result.status()) {
             case ACCEPTED -> {
                 auditLog.record(tenantId, result.event().getId(), "SUBMIT", "accepted");
@@ -50,7 +59,28 @@ public class EventService {
                     "idempotency key already used with different content");
             case OVERLOAD -> throw new ApiException(ErrorCode.BACKPRESSURE_LIMIT, 429,
                     "pending event limit reached");
+            case AGGREGATE_FULL -> throw new ApiException(ErrorCode.AGGREGATE_BACKLOG_LIMIT, 429,
+                    "aggregate backlog limit reached for paused or blocked aggregate");
             default -> throw new ApiException(ErrorCode.INTERNAL_ERROR, 500, "unexpected submit result");
+        }
+    }
+
+    /** 轮询等待被拦截聚合腾出排队空间；返回最后一次提交结果（含超时后的 AGGREGATE_FULL） */
+    private SubmitResult deferSubmit(DeliveryEvent event, SubmitOptions options) {
+        long deadline = System.nanoTime() + properties.getGateDeferTimeout().toNanos();
+        SubmitResult result;
+        while (true) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ApiException(ErrorCode.AGGREGATE_BACKLOG_LIMIT, 429,
+                        "aggregate backlog limit reached; defer interrupted");
+            }
+            result = store.submit(event, options);
+            if (result.status() != SubmitStatus.AGGREGATE_FULL || System.nanoTime() >= deadline) {
+                return result;
+            }
         }
     }
 

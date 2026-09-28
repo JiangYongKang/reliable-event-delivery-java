@@ -2,10 +2,13 @@ package com.github.highcumontoa.reliableeventdeliveryjava.store;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.highcumontoa.reliableeventdeliveryjava.config.DeliveryProperties;
+import com.github.highcumontoa.reliableeventdeliveryjava.domain.BlockReason;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.DeliveryEvent;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.EventStatus;
+import com.github.highcumontoa.reliableeventdeliveryjava.domain.GateState;
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -17,10 +20,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
@@ -31,6 +36,7 @@ import org.springframework.stereotype.Component;
  * 基于本地 JSON 文件的事件存储。
  * 内存索引 + 每次状态变更原子落盘（临时文件 + move），进程重启后从文件恢复。
  * 重启前处于 LEASED 的事件租约到期后会被重新认领，不会重复投递已 DELIVERED 的事件。
+ * 聚合闸门的暂停集合单独持久化到 gates.json，与事件一起在同一把锁内变更。
  */
 @Component
 public class FileEventStore implements EventStore {
@@ -38,6 +44,7 @@ public class FileEventStore implements EventStore {
     private static final Logger log = LoggerFactory.getLogger(FileEventStore.class);
 
     private final Path storeFile;
+    private final Path gatesFile;
     private final ObjectMapper mapper;
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -47,9 +54,16 @@ public class FileEventStore implements EventStore {
     private final Map<String, String> idemIndex = new HashMap<>();
     /** 聚合序号：(tenant|aggKey) -> 已分配的最大 sequence */
     private final Map<String, Long> aggSeq = new HashMap<>();
+    /** 被人工暂停的聚合：(tenant|aggKey) -> 暂停时刻；暂停期间事件照常收下但不被认领 */
+    private final Map<String, Instant> pausedGates = new HashMap<>();
+
+    /** 暂停聚合的持久化记录（供 gates.json 序列化） */
+    public record PausedGate(String tenantId, String aggregateKey, Instant pausedAt) {
+    }
 
     public FileEventStore(DeliveryProperties properties) {
         this.storeFile = Path.of(properties.getStorageDir(), "events.json");
+        this.gatesFile = Path.of(properties.getStorageDir(), "gates.json");
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
@@ -59,16 +73,23 @@ public class FileEventStore implements EventStore {
     void load() {
         lock.lock();
         try {
-            if (!Files.exists(storeFile)) {
-                return;
+            if (Files.exists(storeFile)) {
+                DeliveryEvent[] events = mapper.readValue(storeFile.toFile(), DeliveryEvent[].class);
+                for (DeliveryEvent e : events) {
+                    byId.put(e.getId(), e);
+                    idemIndex.put(idemKey(e.getTenantId(), e.getIdempotencyKey()), e.getId());
+                    aggSeq.merge(aggKey(e.getTenantId(), e.getAggregateKey()), e.getSequence(), Math::max);
+                }
             }
-            DeliveryEvent[] events = mapper.readValue(storeFile.toFile(), DeliveryEvent[].class);
-            for (DeliveryEvent e : events) {
-                byId.put(e.getId(), e);
-                idemIndex.put(idemKey(e.getTenantId(), e.getIdempotencyKey()), e.getId());
-                aggSeq.merge(aggKey(e.getTenantId(), e.getAggregateKey()), e.getSequence(), Math::max);
+            if (Files.exists(gatesFile)) {
+                List<PausedGate> gates = mapper.readValue(gatesFile.toFile(), new TypeReference<List<PausedGate>>() {
+                });
+                for (PausedGate g : gates) {
+                    pausedGates.put(aggKey(g.tenantId(), g.aggregateKey()), g.pausedAt());
+                }
             }
-            log.info("store loaded file={} events={}", storeFile, byId.size());
+            log.info("store loaded file={} events={} pausedGates={}",
+                    storeFile, byId.size(), pausedGates.size());
         } catch (IOException e) {
             throw new UncheckedIOException("failed to load event store " + storeFile, e);
         } finally {
@@ -78,6 +99,11 @@ public class FileEventStore implements EventStore {
 
     @Override
     public SubmitResult submit(DeliveryEvent event, int maxPending) {
+        return submit(event, new SubmitOptions(maxPending, Integer.MAX_VALUE));
+    }
+
+    @Override
+    public SubmitResult submit(DeliveryEvent event, SubmitOptions options) {
         lock.lock();
         try {
             String idemKey = idemKey(event.getTenantId(), event.getIdempotencyKey());
@@ -89,13 +115,17 @@ public class FileEventStore implements EventStore {
                 }
                 return new SubmitResult(SubmitStatus.CONFLICT, null);
             }
-            if (countPendingLocked() >= maxPending) {
+            if (countPendingLocked() >= options.maxPending()) {
                 return new SubmitResult(SubmitStatus.OVERLOAD, null);
             }
+            String aggregate = aggKey(event.getTenantId(), event.getAggregateKey());
+            boolean gated = pausedGates.containsKey(aggregate) || headBlockedLocked(aggregate) != null;
+            if (gated && countAggregateQueuedLocked(aggregate) >= options.maxAggregateBacklog()) {
+                return new SubmitResult(SubmitStatus.AGGREGATE_FULL, null);
+            }
             Instant now = Instant.now();
-            String aggKey = aggKey(event.getTenantId(), event.getAggregateKey());
-            long seq = aggSeq.getOrDefault(aggKey, 0L) + 1;
-            aggSeq.put(aggKey, seq);
+            long seq = aggSeq.getOrDefault(aggregate, 0L) + 1;
+            aggSeq.put(aggregate, seq);
 
             event.setId(UUID.randomUUID().toString());
             event.setSequence(seq);
@@ -148,13 +178,18 @@ public class FileEventStore implements EventStore {
         lock.lock();
         try {
             Instant now = Instant.now();
-            // 每个聚合键的队首（最小 sequence 的非终态事件）
+            // 每个聚合键的队首：最小 sequence 的未完成事件。
+            // 只排除 DELIVERED——FAILED 的队首必须继续挡住后续事件（聚合自动阻塞），直到人工重放。
             Map<String, DeliveryEvent> heads = new HashMap<>();
             for (DeliveryEvent e : byId.values()) {
-                if (e.getStatus() == EventStatus.DELIVERED || e.getStatus() == EventStatus.FAILED) {
+                if (e.getStatus() == EventStatus.DELIVERED) {
                     continue;
                 }
                 String key = aggKey(e.getTenantId(), e.getAggregateKey());
+                // 人工暂停的聚合：新事件照常收下但一件都不投递
+                if (pausedGates.containsKey(key)) {
+                    continue;
+                }
                 heads.merge(key, e, (a, b) -> a.getSequence() <= b.getSequence() ? a : b);
             }
             List<DeliveryEvent> candidates = new ArrayList<>(heads.values());
@@ -285,6 +320,88 @@ public class FileEventStore implements EventStore {
         }
     }
 
+    @Override
+    public boolean pauseGate(String tenantId, String aggregateKey) {
+        lock.lock();
+        try {
+            String key = aggKey(tenantId, aggregateKey);
+            if (pausedGates.containsKey(key)) {
+                return false;
+            }
+            pausedGates.put(key, Instant.now());
+            persistGatesLocked();
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public boolean resumeGate(String tenantId, String aggregateKey) {
+        lock.lock();
+        try {
+            String key = aggKey(tenantId, aggregateKey);
+            if (pausedGates.remove(key) == null) {
+                return false;
+            }
+            persistGatesLocked();
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public Optional<GateView> findGate(String tenantId, String aggregateKey, int backlogLimit) {
+        lock.lock();
+        try {
+            String key = aggKey(tenantId, aggregateKey);
+            Instant pausedAt = pausedGates.get(key);
+            DeliveryEvent head = aggregateHeadLocked(key);
+            int queued = countAggregateQueuedLocked(key);
+            if (pausedAt == null && head == null) {
+                return Optional.empty();
+            }
+            return Optional.of(buildGateViewLocked(tenantId, aggregateKey, key, pausedAt, head, queued, backlogLimit));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public List<GateView> listGates(String tenantId, String state, int backlogLimit) {
+        lock.lock();
+        try {
+            Set<String> aggregates = new HashSet<>();
+            for (DeliveryEvent e : byId.values()) {
+                if (e.getTenantId().equals(tenantId) && e.getStatus() != EventStatus.DELIVERED) {
+                    aggregates.add(aggKey(tenantId, e.getAggregateKey()));
+                }
+            }
+            for (String key : pausedGates.keySet()) {
+                if (belongsToTenant(key, tenantId)) {
+                    aggregates.add(key);
+                }
+            }
+            GateState filter = state == null || state.isBlank() ? null : GateState.valueOf(state);
+            List<GateView> out = new ArrayList<>();
+            for (String key : aggregates) {
+                String aggregateKey = key.substring(tenantId.length() + 1);
+                Instant pausedAt = pausedGates.get(key);
+                DeliveryEvent head = aggregateHeadLocked(key);
+                int queued = countAggregateQueuedLocked(key);
+                GateView view = buildGateViewLocked(tenantId, aggregateKey, key, pausedAt, head, queued, backlogLimit);
+                if (filter == null || view.state() == filter) {
+                    out.add(view);
+                }
+            }
+            out.sort(Comparator.comparing(GateView::aggregateKey));
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // ---- 内部辅助（调用方须持有锁） ----
 
     private int countPendingLocked() {
@@ -296,6 +413,76 @@ public class FileEventStore implements EventStore {
             }
         }
         return n;
+    }
+
+    /** 聚合内最小 sequence 的未投递（非 DELIVERED）事件；没有则 null */
+    private DeliveryEvent aggregateHeadLocked(String key) {
+        DeliveryEvent head = null;
+        for (DeliveryEvent e : byId.values()) {
+            if (!aggKey(e.getTenantId(), e.getAggregateKey()).equals(key)
+                    || e.getStatus() == EventStatus.DELIVERED) {
+                continue;
+            }
+            if (head == null || e.getSequence() < head.getSequence()) {
+                head = e;
+            }
+        }
+        return head;
+    }
+
+    /** 聚合内排队事件数量：所有非 DELIVERED 事件（含卡住的队首与其后的事件） */
+    private int countAggregateQueuedLocked(String key) {
+        int n = 0;
+        for (DeliveryEvent e : byId.values()) {
+            if (aggKey(e.getTenantId(), e.getAggregateKey()).equals(key)
+                    && e.getStatus() != EventStatus.DELIVERED) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * 判定聚合是否被队首自动阻塞：队首 RETRY_WAIT（等下次重试）或 FAILED（彻底失败）即阻塞。
+     * 队首 PENDING / LEASED 表示处理链路正常推进，不视为阻塞。
+     */
+    private BlockReason headBlockedLocked(String key) {
+        DeliveryEvent head = aggregateHeadLocked(key);
+        if (head == null) {
+            return null;
+        }
+        return switch (head.getStatus()) {
+            case RETRY_WAIT -> BlockReason.RETRYING;
+            case FAILED -> BlockReason.PERMANENT_FAILURE;
+            default -> null;
+        };
+    }
+
+    private GateView buildGateViewLocked(String tenantId, String aggregateKey, String key,
+                                         Instant pausedAt, DeliveryEvent head, int queued, int backlogLimit) {
+        boolean paused = pausedAt != null;
+        BlockReason reason = headBlockedLocked(key);
+        GateState state = paused ? GateState.PAUSED
+                : reason != null ? GateState.BLOCKED : GateState.ACTIVE;
+        return new GateView(
+                tenantId,
+                aggregateKey,
+                state,
+                reason == null ? BlockReason.NONE : reason,
+                head == null ? null : head.getId(),
+                head == null ? null : head.getSequence(),
+                head == null ? null : head.getStatus().name(),
+                head == null ? null : head.getAttemptCount(),
+                head == null ? null : head.getLastError(),
+                head == null ? null : head.getNextAttemptAt(),
+                queued,
+                paused,
+                pausedAt,
+                backlogLimit);
+    }
+
+    private static boolean belongsToTenant(String compositeKey, String tenantId) {
+        return compositeKey.startsWith(tenantId + '|');
     }
 
     private DeliveryEvent ownedLeased(String tenantId, String id, String workerId) {
@@ -337,6 +524,24 @@ public class FileEventStore implements EventStore {
             Files.move(tmp, storeFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
             throw new UncheckedIOException("failed to persist event store", e);
+        }
+    }
+
+    /** 暂停集合落盘：与事件变更在同一把锁内完成，重启后暂停状态可恢复 */
+    private void persistGatesLocked() {
+        try {
+            Files.createDirectories(gatesFile.getParent());
+            List<PausedGate> gates = new ArrayList<>();
+            for (Map.Entry<String, Instant> entry : pausedGates.entrySet()) {
+                String key = entry.getKey();
+                int sep = key.indexOf('|');
+                gates.add(new PausedGate(key.substring(0, sep), key.substring(sep + 1), entry.getValue()));
+            }
+            Path tmp = gatesFile.resolveSibling(gatesFile.getFileName() + ".tmp");
+            mapper.writeValue(tmp.toFile(), gates);
+            Files.move(tmp, gatesFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to persist gate store", e);
         }
     }
 

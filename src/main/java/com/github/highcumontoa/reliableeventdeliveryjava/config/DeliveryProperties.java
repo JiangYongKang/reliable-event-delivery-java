@@ -26,6 +26,12 @@ public class DeliveryProperties {
     private int claimBatchSize = 32;
     /** 工作线程扫描间隔 */
     private Duration pollInterval = Duration.ofMillis(100);
+    /** 单个被暂停/被阻塞聚合允许排队的未投递事件上限 */
+    private int gateMaxBacklog = 1000;
+    /** 积压到顶后的策略：REJECT 立即拒绝，DEFER 限时等待 */
+    private GateOverflowPolicy gateOverflowPolicy = GateOverflowPolicy.REJECT;
+    /** DEFER 策略下最长等待时间 */
+    private Duration gateDeferTimeout = Duration.ofSeconds(5);
 
     public String getStorageDir() { return storageDir; }
     public void setStorageDir(String storageDir) { this.storageDir = storageDir; }
@@ -45,4 +51,10 @@ public class DeliveryProperties {
     public void setClaimBatchSize(int claimBatchSize) { this.claimBatchSize = claimBatchSize; }
     public Duration getPollInterval() { return pollInterval; }
     public void setPollInterval(Duration pollInterval) { this.pollInterval = pollInterval; }
+    public int getGateMaxBacklog() { return gateMaxBacklog; }
+    public void setGateMaxBacklog(int gateMaxBacklog) { this.gateMaxBacklog = gateMaxBacklog; }
+    public GateOverflowPolicy getGateOverflowPolicy() { return gateOverflowPolicy; }
+    public void setGateOverflowPolicy(GateOverflowPolicy gateOverflowPolicy) { this.gateOverflowPolicy = gateOverflowPolicy; }
+    public Duration getGateDeferTimeout() { return gateDeferTimeout; }
+    public void setGateDeferTimeout(Duration gateDeferTimeout) { this.gateDeferTimeout = gateDeferTimeout; }
 }

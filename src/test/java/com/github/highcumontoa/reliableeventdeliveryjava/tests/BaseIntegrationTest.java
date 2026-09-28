@@ -1,8 +1,10 @@
 package com.github.highcumontoa.reliableeventdeliveryjava.tests;
 
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.EventView;
+import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.GateViewResponse;
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventRequest;
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventResponse;
+import com.github.highcumontoa.reliableeventdeliveryjava.receiver.LoopbackReceiverController.Received;
 import com.github.highcumontoa.reliableeventdeliveryjava.receiver.LoopbackReceiverController;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -119,5 +121,69 @@ public abstract class BaseIntegrationTest {
         }
         throw new AssertionError("event " + eventId + " did not reach " + expected
                 + ", last=" + (last == null ? "null" : last.status()));
+    }
+
+    protected ResponseEntity<GateViewResponse> pauseGate(String token, String aggKey) {
+        return pauseGate(token, aggKey, null);
+    }
+
+    protected ResponseEntity<GateViewResponse> pauseGate(String token, String aggKey, String declaredTenant) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        headers.set("Content-Type", "application/json");
+        String body = declaredTenant == null ? "{}" : "{\"tenantId\":\"" + declaredTenant + "\"}";
+        return rest.exchange("/api/gates/" + encode(aggKey) + "/pause", HttpMethod.POST,
+                new HttpEntity<>(body, headers), GateViewResponse.class);
+    }
+
+    protected ResponseEntity<GateViewResponse> resumeGate(String token, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        headers.set("Content-Type", "application/json");
+        return rest.exchange("/api/gates/" + encode(aggKey) + "/resume", HttpMethod.POST,
+                new HttpEntity<>("{}", headers), GateViewResponse.class);
+    }
+
+    protected ResponseEntity<GateViewResponse> getGate(String token, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + encode(aggKey), HttpMethod.GET,
+                new HttpEntity<>(headers), GateViewResponse.class);
+    }
+
+    protected ResponseEntity<String> getGateRaw(String token, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + encode(aggKey), HttpMethod.GET,
+                new HttpEntity<>(headers), String.class);
+    }
+
+    protected List<GateViewResponse> listGates(String token, String state) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        String url = "/api/gates" + (state == null ? "" : "?state=" + state);
+        ResponseEntity<List<GateViewResponse>> resp = rest.exchange(url, HttpMethod.GET,
+                new HttpEntity<>(headers), new ParameterizedTypeReference<>() {
+                });
+        return resp.getBody();
+    }
+
+    /** 等待该聚合被接收端记录的投递达到 expectedCount，并返回全部投递 */
+    protected List<Received> awaitAggregateReceived(String aggKey, int expectedCount, Duration timeout)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        List<Received> got = List.of();
+        while (System.nanoTime() < deadline) {
+            got = receiver.recorded().stream().filter(r -> r.aggregateKey().equals(aggKey)).toList();
+            if (got.size() >= expectedCount) {
+                return got;
+            }
+            Thread.sleep(50);
+        }
+        return got;
+    }
+
+    private static String encode(String s) {
+        return java.net.URLEncoder.encode(s, java.nio.charset.StandardCharsets.UTF_8);
     }
 }
