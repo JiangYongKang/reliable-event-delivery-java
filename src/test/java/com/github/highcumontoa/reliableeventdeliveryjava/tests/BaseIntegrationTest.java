@@ -1,6 +1,7 @@
 package com.github.highcumontoa.reliableeventdeliveryjava.tests;
 
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.EventView;
+import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.GateView;
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventRequest;
 import com.github.highcumontoa.reliableeventdeliveryjava.api.dto.SubmitEventResponse;
 import com.github.highcumontoa.reliableeventdeliveryjava.receiver.LoopbackReceiverController;
@@ -97,6 +98,56 @@ public abstract class BaseIntegrationTest {
                 new HttpEntity<>(headers), new ParameterizedTypeReference<>() {
                 });
         return resp.getBody();
+    }
+
+    protected ResponseEntity<GateView> pauseGate(String token, String tenantId, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + tenantId + "/" + aggKey + "/pause", HttpMethod.PUT,
+                new HttpEntity<>(headers), GateView.class);
+    }
+
+    protected ResponseEntity<GateView> resumeGate(String token, String tenantId, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + tenantId + "/" + aggKey + "/resume", HttpMethod.PUT,
+                new HttpEntity<>(headers), GateView.class);
+    }
+
+    protected ResponseEntity<GateView> getGate(String token, String tenantId, String aggKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + tenantId + "/" + aggKey, HttpMethod.GET,
+                new HttpEntity<>(headers), GateView.class);
+    }
+
+    protected ResponseEntity<List<GateView>> listGates(String token, String tenantId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", token);
+        return rest.exchange("/api/gates/" + tenantId, HttpMethod.GET,
+                new HttpEntity<>(headers), new ParameterizedTypeReference<>() {
+                });
+    }
+
+    /** 轮询等待该聚合被接收端收到的条数达到 expected，返回实际收到的列表 */
+    protected List<com.github.highcumontoa.reliableeventdeliveryjava.receiver.LoopbackReceiverController.Received>
+            awaitReceived(String agg, int expected, Duration timeout) {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        List<com.github.highcumontoa.reliableeventdeliveryjava.receiver.LoopbackReceiverController.Received> got
+                = List.of();
+        while (System.nanoTime() < deadline) {
+            got = receiver.recorded().stream().filter(r -> r.aggregateKey().equals(agg)).toList();
+            if (got.size() >= expected) {
+                return got;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        return got;
     }
 
     /** 轮询等待事件到达目标状态，并打印判定依据 */

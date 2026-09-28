@@ -50,6 +50,8 @@ public class EventService {
                     "idempotency key already used with different content");
             case OVERLOAD -> throw new ApiException(ErrorCode.BACKPRESSURE_LIMIT, 429,
                     "pending event limit reached");
+            case GATE_OVERFLOW -> throw new ApiException(ErrorCode.GATE_CAPACITY_EXCEEDED, 429,
+                    "gated aggregate queued event limit reached");
             default -> throw new ApiException(ErrorCode.INTERNAL_ERROR, 500, "unexpected submit result");
         }
     }

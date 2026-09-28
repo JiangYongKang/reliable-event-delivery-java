@@ -9,5 +9,7 @@ public enum SubmitStatus {
     /** 幂等键相同但内容冲突，必须拒绝 */
     CONFLICT,
     /** 积压超限，按策略拒绝 */
-    OVERLOAD
+    OVERLOAD,
+    /** 聚合闸门（暂停/阻塞）排队到顶，按策略拒绝 */
+    GATE_OVERFLOW
 }

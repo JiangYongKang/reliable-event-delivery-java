@@ -1,11 +1,15 @@
 package com.github.highcumontoa.reliableeventdeliveryjava.store;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.highcumontoa.reliableeventdeliveryjava.config.DeliveryProperties;
+import com.github.highcumontoa.reliableeventdeliveryjava.config.OverflowPolicy;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.DeliveryEvent;
 import com.github.highcumontoa.reliableeventdeliveryjava.domain.EventStatus;
+import com.github.highcumontoa.reliableeventdeliveryjava.gate.AggregateGate;
+import com.github.highcumontoa.reliableeventdeliveryjava.gate.GateStore;
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -40,6 +44,8 @@ public class FileEventStore implements EventStore {
     private final Path storeFile;
     private final ObjectMapper mapper;
     private final ReentrantLock lock = new ReentrantLock();
+    private final DeliveryProperties properties;
+    private final GateStore gateStore;
 
     /** 全量事件，id -> event */
     private final Map<String, DeliveryEvent> byId = new LinkedHashMap<>();
@@ -48,11 +54,20 @@ public class FileEventStore implements EventStore {
     /** 聚合序号：(tenant|aggKey) -> 已分配的最大 sequence */
     private final Map<String, Long> aggSeq = new HashMap<>();
 
+    /** 便捷构造：自带独立 GateStore（测试与本地使用），不加载既有闸门文件 */
     public FileEventStore(DeliveryProperties properties) {
+        this(properties, new GateStore(properties));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public FileEventStore(DeliveryProperties properties, GateStore gateStore) {
+        this.properties = properties;
+        this.gateStore = gateStore;
         this.storeFile = Path.of(properties.getStorageDir(), "events.json");
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
-                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     }
 
     @PostConstruct
@@ -91,6 +106,14 @@ public class FileEventStore implements EventStore {
             }
             if (countPendingLocked() >= maxPending) {
                 return new SubmitResult(SubmitStatus.OVERLOAD, null);
+            }
+            // 闸门关闭（暂停/阻塞）的聚合：排队到顶后按策略拒绝或推迟接收
+            AggregateGate gate = gateStore.snapshot(event.getTenantId(), event.getAggregateKey()).orElse(null);
+            if (gate != null && (gate.isPaused() || gate.isBlocked())
+                    && countQueuedForAggregateLocked(event.getTenantId(), event.getAggregateKey(), null)
+                            >= properties.getGateMaxQueuedPerAggregate()
+                    && properties.getGateOverflowPolicy() == OverflowPolicy.REJECT) {
+                return new SubmitResult(SubmitStatus.GATE_OVERFLOW, null);
             }
             Instant now = Instant.now();
             String aggKey = aggKey(event.getTenantId(), event.getAggregateKey());
@@ -166,6 +189,9 @@ public class FileEventStore implements EventStore {
                 if (claimed.size() >= max) {
                     break;
                 }
+                if (gateBlocksLocked(e)) {
+                    continue;
+                }
                 boolean claimable = switch (e.getStatus()) {
                     case PENDING -> true;
                     case RETRY_WAIT -> !e.getNextAttemptAt().isAfter(now);
@@ -204,6 +230,8 @@ public class FileEventStore implements EventStore {
             e.setLastError(null);
             e.setUpdatedAt(Instant.now());
             persistLocked();
+            // 卡住本聚合的事件投递成功：自动放行闸门，后续事件按序继续
+            gateStore.unblockIfBlockedBy(tenantId, e.getAggregateKey(), id);
             return true;
         } finally {
             lock.unlock();
@@ -227,6 +255,8 @@ public class FileEventStore implements EventStore {
             e.setLastError(sanitize(error));
             e.setUpdatedAt(Instant.now());
             persistLocked();
+            // 还有事件没处理完（等下次重试）：聚合自动进入阻塞，后续事件排队
+            gateStore.block(tenantId, e.getAggregateKey(), id, "RETRY_WAIT:" + failureKind);
             return true;
         } finally {
             lock.unlock();
@@ -248,6 +278,8 @@ public class FileEventStore implements EventStore {
             e.setLastError(sanitize(error));
             e.setUpdatedAt(Instant.now());
             persistLocked();
+            // 彻底失败：聚合自动进入阻塞，后续事件排队等待人工重放
+            gateStore.block(tenantId, e.getAggregateKey(), id, "FAILED:" + failureKind);
             return true;
         } finally {
             lock.unlock();
@@ -285,7 +317,59 @@ public class FileEventStore implements EventStore {
         }
     }
 
+    @Override
+    public int countQueuedForAggregate(String tenantId, String aggregateKey, Long afterSequence) {
+        lock.lock();
+        try {
+            return countQueuedForAggregateLocked(tenantId, aggregateKey, afterSequence);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // ---- 内部辅助（调用方须持有锁） ----
+
+    /**
+     * 闸门拦截判定：暂停的聚合整队跳过；阻塞的聚合只允许卡住它的那个事件被认领，
+     * 后续事件排队等待，不得越过先生效。
+     */
+    private boolean gateBlocksLocked(DeliveryEvent e) {
+        AggregateGate gate = gateStore.snapshot(e.getTenantId(), e.getAggregateKey()).orElse(null);
+        if (gate == null) {
+            return false;
+        }
+        if (gate.isPaused()) {
+            return true;
+        }
+        if (!gate.isBlocked()) {
+            return false;
+        }
+        DeliveryEvent blocker = byId.get(gate.getBlockedEventId());
+        if (blocker == null || blocker.getStatus() == EventStatus.DELIVERED) {
+            // 崩溃窗口留下的陈旧阻塞（事件已投递但闸门未放行），自愈放行
+            gateStore.unblockIfBlockedBy(e.getTenantId(), e.getAggregateKey(), gate.getBlockedEventId());
+            return false;
+        }
+        return !gate.getBlockedEventId().equals(e.getId());
+    }
+
+    private int countQueuedForAggregateLocked(String tenantId, String aggregateKey, Long afterSequence) {
+        int n = 0;
+        for (DeliveryEvent e : byId.values()) {
+            if (!e.getTenantId().equals(tenantId) || !e.getAggregateKey().equals(aggregateKey)) {
+                continue;
+            }
+            if (e.getStatus() != EventStatus.PENDING && e.getStatus() != EventStatus.RETRY_WAIT
+                    && e.getStatus() != EventStatus.LEASED) {
+                continue;
+            }
+            if (afterSequence != null && e.getSequence() <= afterSequence) {
+                continue;
+            }
+            n++;
+        }
+        return n;
+    }
 
     private int countPendingLocked() {
         int n = 0;

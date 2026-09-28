@@ -26,6 +26,10 @@ public class DeliveryProperties {
     private int claimBatchSize = 32;
     /** 工作线程扫描间隔 */
     private Duration pollInterval = Duration.ofMillis(100);
+    /** 被暂停/阻塞的单个聚合允许累积的排队事件上限，到顶按 gate-overflow-policy 处理 */
+    private int gateMaxQueuedPerAggregate = 1000;
+    /** 闸门聚合排队到顶时的策略：REJECT 拒绝 / DEFER 推迟接收 */
+    private OverflowPolicy gateOverflowPolicy = OverflowPolicy.REJECT;
 
     public String getStorageDir() { return storageDir; }
     public void setStorageDir(String storageDir) { this.storageDir = storageDir; }
@@ -45,4 +49,12 @@ public class DeliveryProperties {
     public void setClaimBatchSize(int claimBatchSize) { this.claimBatchSize = claimBatchSize; }
     public Duration getPollInterval() { return pollInterval; }
     public void setPollInterval(Duration pollInterval) { this.pollInterval = pollInterval; }
+    public int getGateMaxQueuedPerAggregate() { return gateMaxQueuedPerAggregate; }
+    public void setGateMaxQueuedPerAggregate(int gateMaxQueuedPerAggregate) {
+        this.gateMaxQueuedPerAggregate = gateMaxQueuedPerAggregate;
+    }
+    public OverflowPolicy getGateOverflowPolicy() { return gateOverflowPolicy; }
+    public void setGateOverflowPolicy(OverflowPolicy gateOverflowPolicy) {
+        this.gateOverflowPolicy = gateOverflowPolicy;
+    }
 }

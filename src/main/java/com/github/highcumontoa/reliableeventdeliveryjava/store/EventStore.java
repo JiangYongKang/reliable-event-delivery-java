@@ -36,4 +36,10 @@ public interface EventStore {
     boolean replay(String tenantId, String id);
 
     int countPending();
+
+    /**
+     * 统计某聚合内排队中的事件数（PENDING/RETRY_WAIT/LEASED）。
+     * afterSequence 非 null 时只统计序号在其之后的事件（即“卡在 blocked 事件后面还排了多少件”）。
+     */
+    int countQueuedForAggregate(String tenantId, String aggregateKey, Long afterSequence);
 }

@@ -31,6 +31,8 @@ public class LoopbackReceiverController {
     private final List<Received> received = new CopyOnWriteArrayList<>();
     private final AtomicInteger flakyCalls = new AtomicInteger();
     private volatile int flakyFailures = 2;
+    /** switchable 模式：true 时返回 400（永久拒绝），false 时正常接收；测试中途可切换 */
+    private volatile boolean switchableReject = true;
 
     @PostMapping("/{mode}")
     public ResponseEntity<String> receive(@PathVariable String mode,
@@ -60,6 +62,13 @@ public class LoopbackReceiverController {
                 received.add(new Received(eventId, aggregateKey, sequence, payload));
                 return ResponseEntity.ok("accepted");
             }
+            case "switchable" -> {
+                if (switchableReject) {
+                    return ResponseEntity.status(400).body("rejected while switched off");
+                }
+                received.add(new Received(eventId, aggregateKey, sequence, payload));
+                return ResponseEntity.ok("accepted");
+            }
             default -> {
                 return ResponseEntity.status(404).body("unknown mode");
             }
@@ -75,9 +84,21 @@ public class LoopbackReceiverController {
     public void reset() {
         received.clear();
         flakyCalls.set(0);
+        switchableReject = true;
+    }
+
+    /** 切换 switchable 模式：reject=true 拒绝（默认），false 正常接收；用于阻塞后重放的本地验证 */
+    @PostMapping("/switch")
+    public void switchMode(@org.springframework.web.bind.annotation.RequestParam(defaultValue = "true")
+                           boolean reject) {
+        switchableReject = reject;
     }
 
     public void setFlakyFailures(int n) {
         this.flakyFailures = n;
+    }
+
+    public void setSwitchableReject(boolean reject) {
+        this.switchableReject = reject;
     }
 }
