@@ -4,6 +4,6 @@ package com.github.highcumontoa.reliableeventdeliveryjava.config;
 public enum OverflowPolicy {
     /** 拒绝：429 GATE_CAPACITY_EXCEEDED */
     REJECT,
-    /** 推迟：照常接收并入队，等闸门打开后按序投递（仍受全局 max-pending 约束） */
+    /** 推迟：429 GATE_CAPACITY_DEFERRED + Retry-After，本次不入队，客户端稍后以同一幂等键重试 */
     DEFER
 }

@@ -152,6 +152,22 @@ public class GateStore {
         }
     }
 
+    /** 列出全部闸门记录（含 OPEN 占位），供启动时对账使用；按聚合键排序保证输出稳定。 */
+    public List<AggregateGate> listAll() {
+        lock.lock();
+        try {
+            List<AggregateGate> out = new ArrayList<>();
+            for (AggregateGate g : gates.values()) {
+                out.add(copy(g));
+            }
+            out.sort((a, b) -> (a.getTenantId() + '|' + a.getAggregateKey())
+                    .compareTo(b.getTenantId() + '|' + b.getAggregateKey()));
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // ---- 内部辅助（调用方须持有锁） ----
 
     private AggregateGate getOrCreateLocked(String tenantId, String aggregateKey) {

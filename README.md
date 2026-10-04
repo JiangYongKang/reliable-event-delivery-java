@@ -86,11 +86,29 @@
 
 ### 排队容量（不无界占内存）
 
-- 被暂停/阻塞的聚合，其排队事件数达到 `gate-max-queued-per-aggregate` 后，按
-  `gate-overflow-policy` 处理新提交：
+- 被暂停/阻塞的聚合，其排队事件数达到 `gate-max-queued-per-aggregate` 后，两种
+  `gate-overflow-policy` 都**不再接收**新提交（队列不会越过上限增长）：
   - `REJECT`（默认）：`429 GATE_CAPACITY_EXCEEDED`，与全局积压的 `429 BACKPRESSURE_LIMIT` 可区分。
-  - `DEFER`：照常接收并入队（仍受全局 `max-pending` 约束），闸门打开后按序投递。
+  - `DEFER`：`429 GATE_CAPACITY_DEFERRED` 并带 `Retry-After` 头，本次提交**不入队**；
+    客户端稍后以**同一幂等键**重试，闸门打开后即可接收并按序投递。
+    与 `GATE_CAPACITY_EXCEEDED`（硬拒绝）、`BACKPRESSURE_LIMIT`（全局积压）三者互不混淆。
 - 排队数可通过闸门查询查看：阻塞时只统计“卡在 blocked 事件之后”的件数。
+
+### 中断 / 重启后的阻塞与恢复语义
+
+落状态分两步：先写 `events.json`（事件状态），再写 `gates.json`（闸门阻塞）。进程在两步之间
+被强杀（掉电、kill、OOM）会留下“事件已是 RETRY_WAIT/FAILED、闸门却没记上阻塞”（或反向的
+陈旧阻塞）。为此**每次启动都做对账**：以事件文件为权威，按每个聚合的队首
+（最小 sequence 的非 DELIVERED 事件）修正闸门——
+
+- 队首在等重试（`RETRY_WAIT`）或已彻底失败（`FAILED`）→ 重建阻塞：闸门重新卡住该事件，
+  阻塞原因由事件上持久化的失败分类重建（形如 `RETRY_WAIT:TIMEOUT`、`FAILED:CLIENT_REJECTED`），
+  后续事件一件都不能越过它。
+- 队首已可投递而阻塞指向其它事件、或聚合事件全部已投递 → 视为崩溃窗口留下的陈旧阻塞，自动放行。
+- 对账幂等：同一份本地状态反复重启结果完全一致——已 `DELIVERED` 的事件不会重复投递，
+  排队件数不增不减，卡住的事件与原因每次重启都查得到（`GET /api/gates/...`）。
+- 人工重放 FAILED 队首后重启：阻塞仍指向该事件（重放途中不放行），只有它可被认领，
+  投递成功后自动放行，后续事件按原 `sequence` 继续。
 
 ### 闸门 API
 
@@ -111,7 +129,8 @@
 
 - 待投递数量（PENDING+RETRY_WAIT+LEASED）达到 `max-pending` 后，新提交返回 `429 BACKPRESSURE_LIMIT`。
 - 被暂停/阻塞聚合的排队达到 `gate-max-queued-per-aggregate` 后，按 `gate-overflow-policy`（REJECT/DEFER）处理，
-  REJECT 返回 `429 GATE_CAPACITY_EXCEEDED`，两个拒绝原因互不混淆。
+  REJECT 返回 `429 GATE_CAPACITY_EXCEEDED`，DEFER 返回 `429 GATE_CAPACITY_DEFERRED` + `Retry-After`
+  （本次不入队，稍后以同一幂等键重试），三种拒绝原因互不混淆，且两种策略下队列都不会越过上限。
 - 单次认领批量上限 `claim-batch-size`，单次投递超时 `delivery-timeout`，避免无界占用。
 
 ## 持久化与恢复语义
@@ -120,6 +139,8 @@
   每次状态变更先写临时文件再原子 move。
 - 重启后：全部事件、幂等索引与闸门（暂停/阻塞状态、卡住的事件、阻塞原因）从文件恢复；`DELIVERED` 不会重复投递；
   `PENDING`/到期 `RETRY_WAIT` 立即可认领；崩溃时处于 `LEASED` 的事件在租约过期后被回收重投（接收端需按事件 id 幂等，回环接收端按 sequence 验证不重复生效）。
+- 启动时以事件状态为准对账闸门（见上文“中断 / 重启后的阻塞与恢复语义”）：即使进程在
+  “落事件状态”和“落闸门状态”之间被强杀，恢复后闸门仍与实际事件状态一致——队首没处理完就仍然阻塞。
 - 闸门拦截在认领阶段生效，所以恢复后被暂停的聚合仍然一件不出、被阻塞的聚合仍然只有卡住事件可认领，
   卡住事件成功后自动放行，未投完的排队事件按序接着来。
 
@@ -141,7 +162,7 @@
 | max-attempts | 5 | 最大尝试次数（含首次） |
 | max-pending | 10000 | 全局待投递数量上限 |
 | gate-max-queued-per-aggregate | 1000 | 被暂停/阻塞的单个聚合排队事件上限 |
-| gate-overflow-policy | REJECT | 聚合排队到顶策略：REJECT 拒绝（429 GATE_CAPACITY_EXCEEDED）/ DEFER 推迟接收 |
+| gate-overflow-policy | REJECT | 聚合排队到顶策略：REJECT 拒绝（429 GATE_CAPACITY_EXCEEDED）/ DEFER 推迟（429 GATE_CAPACITY_DEFERRED + Retry-After，不入队，稍后重试） |
 | claim-batch-size | 32 | 单次认领批量上限 |
 | poll-interval | 100ms | 工作线程扫描间隔 |
 
@@ -152,7 +173,8 @@
 - `POST /api/events/{id}/replay` → 重放 FAILED 事件（非 FAILED 返回 `409 EVENT_NOT_REPLAYABLE`）
 - `PUT /api/gates/{tenantId}/{aggregateKey}/pause` / `/resume` → 聚合闸门暂停 / 恢复
 - `GET /api/gates/{tenantId}/{aggregateKey}` / `GET /api/gates/{tenantId}` → 闸门与排队查询
-- 跨租户闸门操作 → `403 TENANT_FORBIDDEN`；聚合排队到顶（REJECT）→ `429 GATE_CAPACITY_EXCEEDED`
+- 跨租户闸门操作 → `403 TENANT_FORBIDDEN`；聚合排队到顶（REJECT）→ `429 GATE_CAPACITY_EXCEEDED`；
+  聚合排队到顶（DEFER）→ `429 GATE_CAPACITY_DEFERRED` + `Retry-After`（本次不入队，稍后以同一幂等键重试）
 
 ## 本地验证
 
@@ -173,9 +195,10 @@ mvn test
 | BackpressureTests | 积压超限 429 拒绝 |
 | GatePauseResumeTests | 暂停期间不投递且不影响其它租户/聚合、恢复后按序继续、跨租户操作 403 |
 | GateBlockingTests | 重试中/彻底失败自动阻塞与排队查询、重放后按序放行、暂停+重放+恢复交织顺序 |
-| GateCapacityTests | 排队到顶 REJECT（429 GATE_CAPACITY_EXCEEDED，与全局背压可区分） |
-| GateDeferPolicyTests | DEFER 策略到顶仍接收，恢复后按序投递 |
+| GateCapacityTests | 暂停/阻塞聚合排队到顶 REJECT（429 GATE_CAPACITY_EXCEEDED，与全局背压可区分），被拒提交不入库、队列不越限 |
+| GateDeferPolicyTests | DEFER 策略到顶返回 429 GATE_CAPACITY_DEFERRED + Retry-After（不入队），恢复后同键重试接收并按序投递 |
 | GateRestartRecoveryTests | 重启后暂停/阻塞/积压恢复，不重复投递、不跳号 |
+| GateCrashRecoveryTests | 落状态两步之间被强杀后的阻塞恢复（RETRY_WAIT/FAILED 队首）、陈旧阻塞自愈、反复重启结果一致（不重复投递、不跳号、排队数不增不减） |
 
 回环接收端 `/receiver/{mode}`：`ok` / `timeout` / `server-error` / `reject` / `flaky` / `switchable`
 （`switchable` 初始拒绝、测试中途可切回正常接收，用于阻塞后重放场景），
@@ -198,4 +221,31 @@ curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/
 curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/$AGG/resume
 # 跨租户操作被拒绝：403 TENANT_FORBIDDEN
 curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-b/$AGG/pause
+```
+
+### 手动验证：崩溃恢复与排队上限
+
+**崩溃后续投（落状态被打断）**：自动化见 `GateCrashRecoveryTests`（用闸门文件回滚模拟
+“events.json 已落盘、gates.json 未落盘”的强杀）。手动验证等价场景：
+
+```bash
+# 1. 起一个实例，提交一个会暂时性失败的队首事件（接收端 5xx），再排几件在它后面
+curl -s -H "X-Api-Key: token-a-secret" -H "Content-Type: application/json" \
+  -d '{"idempotencyKey":"c1","aggregateKey":"agg-crash","payload":"p1","targetUrl":"http://localhost:8080/receiver/server-error"}' \
+  http://localhost:8080/api/events
+# 2. 在事件进入 RETRY_WAIT 后立刻 kill -9 进程（模拟落闸门状态前被强杀）
+# 3. 重新启动：启动日志出现 "gate reconciled ... action=block ..."；
+#    查询闸门应仍为 BLOCKED，能看到 blockedEventId、blockReason=RETRY_WAIT:SERVER_ERROR、queuedCount
+curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-crash
+# 4. 排在后面的事件一件都不会越过队首；队首重试成功（或重放成功）后自动放行，按序补上
+```
+
+**排队上限与到顶策略**：
+
+```bash
+# 以小上限启动：REJECT 策略
+mvn spring-boot:run -Dspring-boot.run.arguments="--delivery.gate-max-queued-per-aggregate=2 --delivery.gate-overflow-policy=REJECT"
+# 暂停某聚合后连发 3 件：前 2 件 202，第 3 件 429 GATE_CAPACITY_EXCEEDED；继续发仍 429，queuedCount 恒为 2
+# 换 DEFER 策略启动同样操作：第 3 件返回 429 GATE_CAPACITY_DEFERRED 且响应带 Retry-After 头；
+# 该件不入队（queuedCount 不变），resume 后用同一幂等键重发即 202，最终按序投递
 ```

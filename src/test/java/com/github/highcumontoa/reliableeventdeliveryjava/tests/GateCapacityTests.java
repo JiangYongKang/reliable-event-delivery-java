@@ -3,6 +3,7 @@ package com.github.highcumontoa.reliableeventdeliveryjava.tests;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.github.highcumontoa.reliableeventdeliveryjava.gate.GateStore;
+import com.github.highcumontoa.reliableeventdeliveryjava.store.EventStore;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,6 +54,9 @@ class GateCapacityTests {
     @Autowired
     GateStore gateStore;
 
+    @Autowired
+    EventStore eventStore;
+
     @Test
     void submissionsBeyondGateLimitAreRejectedWithDistinctReason() {
         String agg = "agg-cap-" + UUID.randomUUID();
@@ -73,6 +77,30 @@ class GateCapacityTests {
         // 未闸门的聚合不受闸门上限影响
         ResponseEntity<String> free = submit("free-" + UUID.randomUUID(), "agg-free-" + UUID.randomUUID());
         assertThat(free.getStatusCode().value()).isEqualTo(202);
+    }
+
+    @Test
+    void blockedAggregateAlsoEnforcesLimitAndRejectedSubmissionsAreNotStored() {
+        String agg = "agg-cap-blocked-" + UUID.randomUUID();
+        // 队首彻底失败造成阻塞（直接落阻塞态，等价于队首 FAILED 后的自动阻塞）
+        assertThat(submit("b0-" + UUID.randomUUID(), agg).getStatusCode().value()).isEqualTo(202);
+        String headId = eventStore.listByTenant("tenant-a").stream()
+                .filter(e -> e.getAggregateKey().equals(agg)).findFirst().orElseThrow().getId();
+        gateStore.block("tenant-a", agg, headId, "FAILED:CLIENT_REJECTED");
+
+        // 上限=2：队首已占 1 件，第 2 件接收（queued=1 < 2），第 3 件起到顶拒绝
+        assertThat(submit("b1-" + UUID.randomUUID(), agg).getStatusCode().value()).isEqualTo(202);
+        ResponseEntity<String> rejected = submit("b2-" + UUID.randomUUID(), agg);
+        log.info("assertion basis: blocked agg at limit=2, overflow submit -> {} body={}",
+                rejected.getStatusCode(), rejected.getBody());
+        assertThat(rejected.getStatusCode().value()).isEqualTo(429);
+        assertThat(rejected.getBody()).contains("GATE_CAPACITY_EXCEEDED");
+
+        // 继续提交仍拒绝，且被拒绝的提交没有入库：排队数稳定在上限，不无界增长
+        assertThat(submit("b3-" + UUID.randomUUID(), agg).getStatusCode().value()).isEqualTo(429);
+        int queued = eventStore.countQueuedForAggregate("tenant-a", agg, null);
+        log.info("assertion basis: after rejected submits queued={} (limit=2)", queued);
+        assertThat(queued).isEqualTo(2);
     }
 
     private ResponseEntity<String> submit(String idem, String agg) {

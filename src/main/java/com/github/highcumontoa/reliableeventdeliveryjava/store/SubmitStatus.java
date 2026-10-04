@@ -11,5 +11,7 @@ public enum SubmitStatus {
     /** 积压超限，按策略拒绝 */
     OVERLOAD,
     /** 聚合闸门（暂停/阻塞）排队到顶，按策略拒绝 */
-    GATE_OVERFLOW
+    GATE_OVERFLOW,
+    /** 聚合闸门（暂停/阻塞）排队到顶，按策略推迟：本次不接收，客户端应稍后重试同一幂等键 */
+    GATE_DEFER
 }
