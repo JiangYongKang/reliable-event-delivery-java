@@ -26,8 +26,9 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 /**
- * 闸门容量：DEFER 策略下，排队到顶后新提交照常接收（202）并排队，
- * 等闸门打开后按原顺序投递；内存仍受全局 max-pending 约束。
+ * 闸门容量：DEFER 策略下排队上限同样生效——到顶后新提交不被接收，
+ * 返回 429 GATE_CAPACITY_DEFERRED（带 Retry-After，与 REJECT 的 GATE_CAPACITY_EXCEEDED、
+ * 全局 BACKPRESSURE_LIMIT 都可区分），排队数不越过上限；闸门打开后客户端重试成功，按原顺序投递。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "delivery.gate-max-queued-per-aggregate=2",
@@ -65,19 +66,36 @@ class GateDeferPolicyTests {
     LoopbackReceiverController receiver;
 
     @Test
-    void submissionsBeyondGateLimitAreDeferredNotRejected() {
+    void submissionsBeyondGateLimitAreDeferredUntilGateOpens() {
         String agg = "agg-defer-" + UUID.randomUUID();
         gateStore.pause("tenant-a", agg);
 
-        // 上限为 2，提交 4 件：DEFER 策略下全部接收
-        for (int i = 0; i < 4; i++) {
-            ResponseEntity<String> resp = submit("k" + i + "-" + UUID.randomUUID(), agg, i);
+        // 上限为 2：前 2 件接收
+        for (int i = 0; i < 2; i++) {
+            ResponseEntity<String> resp = submit("k" + i + "-" + agg, agg, i);
             assertThat(resp.getStatusCode().value()).isEqualTo(202);
         }
-        log.info("assertion basis: defer policy accepted 4 submissions over limit=2");
+        // 第 3/4 件到顶：DEFER 策略下不接收，原因可区分且带 Retry-After，队列不再增长
+        String k2 = "k2-" + agg;
+        String k3 = "k3-" + agg;
+        ResponseEntity<String> deferred = submit(k2, agg, 2);
+        ResponseEntity<String> deferredAgain = submit(k3, agg, 3);
+        log.info("assertion basis: defer policy limit=2, 3rd/4th submit -> {} {} retryAfter={}",
+                deferred.getStatusCode(), deferredAgain.getStatusCode(),
+                deferred.getHeaders().getFirst("Retry-After"));
+        assertThat(deferred.getStatusCode().value()).isEqualTo(429);
+        assertThat(deferred.getBody()).contains("GATE_CAPACITY_DEFERRED");
+        assertThat(deferred.getBody()).doesNotContain("GATE_CAPACITY_EXCEEDED");
+        assertThat(deferred.getBody()).doesNotContain("BACKPRESSURE_LIMIT");
+        assertThat(deferred.getHeaders().getFirst("Retry-After")).isNotBlank();
+        assertThat(deferredAgain.getStatusCode().value()).isEqualTo(429);
 
-        // 恢复后按原提交顺序全部投递
+        // 被推迟的提交不占幂等键、不入队：闸门打开后客户端原样重试即被接收
         gateStore.resume("tenant-a", agg);
+        assertThat(submit(k2, agg, 2).getStatusCode().value()).isEqualTo(202);
+        assertThat(submit(k3, agg, 3).getStatusCode().value()).isEqualTo(202);
+
+        // 4 件按原提交顺序全部投递
         long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
         List<Received> got = List.of();
         while (System.nanoTime() < deadline) {
@@ -93,7 +111,8 @@ class GateDeferPolicyTests {
             }
         }
         long[] seqs = got.stream().mapToLong(Received::sequence).toArray();
-        log.info("assertion basis: deferred deliveries sequences={}", java.util.Arrays.toString(seqs));
+        log.info("assertion basis: deliveries after defer+resume sequences={}",
+                java.util.Arrays.toString(seqs));
         assertThat(seqs).containsExactly(1, 2, 3, 4);
     }
 

@@ -152,6 +152,59 @@ public class GateStore {
         }
     }
 
+    /** 列出全部闸门快照（含 OPEN），供重启对账遍历。 */
+    public List<AggregateGate> listAll() {
+        lock.lock();
+        try {
+            List<AggregateGate> out = new ArrayList<>();
+            for (AggregateGate g : gates.values()) {
+                out.add(copy(g));
+            }
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 重启对账：把闸门的自动阻塞状态对齐到事件存储推导出的结果。
+     * eventId 非 null 表示该聚合应被此事件阻塞（崩溃窗口丢失的阻塞会被补回）；
+     * eventId 为 null 表示不应阻塞（卡住事件已投递等留下的陈旧阻塞会被清除）。
+     * 只影响自动阻塞，不影响人工暂停。幂等：状态已一致时不落盘、返回 false。
+     *
+     * @return 是否发生了状态变更
+     */
+    public boolean reconcileBlock(String tenantId, String aggregateKey, String eventId, String reason) {
+        lock.lock();
+        try {
+            AggregateGate g = gates.get(key(tenantId, aggregateKey));
+            if (eventId == null) {
+                if (g == null || !g.isBlocked()) {
+                    return false;
+                }
+                g.setBlockedEventId(null);
+                g.setBlockReason(null);
+                g.setUpdatedAt(Instant.now());
+                persistLocked();
+                return true;
+            }
+            if (g == null) {
+                g = getOrCreateLocked(tenantId, aggregateKey);
+            }
+            if (eventId.equals(g.getBlockedEventId())
+                    && java.util.Objects.equals(reason, g.getBlockReason())) {
+                return false;
+            }
+            g.setBlockedEventId(eventId);
+            g.setBlockReason(reason);
+            g.setUpdatedAt(Instant.now());
+            persistLocked();
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // ---- 内部辅助（调用方须持有锁） ----
 
     private AggregateGate getOrCreateLocked(String tenantId, String aggregateKey) {

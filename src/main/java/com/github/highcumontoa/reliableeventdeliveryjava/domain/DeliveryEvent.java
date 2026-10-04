@@ -19,6 +19,8 @@ public class DeliveryEvent {
     private Instant createdAt;
     private Instant updatedAt;
     private String lastError;
+    /** 最近一次失败的分类（markRetry/markFailed 时写入），重启对账时用于重建闸门阻塞原因 */
+    private String lastFailureKind;
 
     public DeliveryEvent() {
     }
@@ -53,6 +55,8 @@ public class DeliveryEvent {
     public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
     public String getLastError() { return lastError; }
     public void setLastError(String lastError) { this.lastError = lastError; }
+    public String getLastFailureKind() { return lastFailureKind; }
+    public void setLastFailureKind(String lastFailureKind) { this.lastFailureKind = lastFailureKind; }
 
     @Override
     public String toString() {

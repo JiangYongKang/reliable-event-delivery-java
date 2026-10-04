@@ -86,10 +86,12 @@
 
 ### 排队容量（不无界占内存）
 
-- 被暂停/阻塞的聚合，其排队事件数达到 `gate-max-queued-per-aggregate` 后，按
-  `gate-overflow-policy` 处理新提交：
+- 被暂停/阻塞的聚合，其排队事件数达到 `gate-max-queued-per-aggregate` 后，两种
+  `gate-overflow-policy` 都**不允许排队数越过上限**：
   - `REJECT`（默认）：`429 GATE_CAPACITY_EXCEEDED`，与全局积压的 `429 BACKPRESSURE_LIMIT` 可区分。
-  - `DEFER`：照常接收并入队（仍受全局 `max-pending` 约束），闸门打开后按序投递。
+  - `DEFER`：本次不接收，返回 `429 GATE_CAPACITY_DEFERRED` 并带 `Retry-After` 响应头，
+    客户端稍后原样重试（幂等键未被占用，闸门打开后重试即被接收，仍按原顺序投递）。
+    三种 429 原因（全局背压 / 到顶拒绝 / 到顶推迟）互不混淆。
 - 排队数可通过闸门查询查看：阻塞时只统计“卡在 blocked 事件之后”的件数。
 
 ### 闸门 API
@@ -110,8 +112,9 @@
 ## 积压与资源约束
 
 - 待投递数量（PENDING+RETRY_WAIT+LEASED）达到 `max-pending` 后，新提交返回 `429 BACKPRESSURE_LIMIT`。
-- 被暂停/阻塞聚合的排队达到 `gate-max-queued-per-aggregate` 后，按 `gate-overflow-policy`（REJECT/DEFER）处理，
-  REJECT 返回 `429 GATE_CAPACITY_EXCEEDED`，两个拒绝原因互不混淆。
+- 被暂停/阻塞聚合的排队达到 `gate-max-queued-per-aggregate` 后，按 `gate-overflow-policy`（REJECT/DEFER）处理：
+  REJECT 返回 `429 GATE_CAPACITY_EXCEEDED`，DEFER 返回 `429 GATE_CAPACITY_DEFERRED` + `Retry-After`，
+  与全局 `429 BACKPRESSURE_LIMIT` 三个原因互不混淆，两种策略下排队数都不会越过上限。
 - 单次认领批量上限 `claim-batch-size`，单次投递超时 `delivery-timeout`，避免无界占用。
 
 ## 持久化与恢复语义
@@ -122,6 +125,22 @@
   `PENDING`/到期 `RETRY_WAIT` 立即可认领；崩溃时处于 `LEASED` 的事件在租约过期后被回收重投（接收端需按事件 id 幂等，回环接收端按 sequence 验证不重复生效）。
 - 闸门拦截在认领阶段生效，所以恢复后被暂停的聚合仍然一件不出、被阻塞的聚合仍然只有卡住事件可认领，
   卡住事件成功后自动放行，未投完的排队事件按序接着来。
+
+### 中断/重启后的闸门对账
+
+落状态是分两盘写的（先 `events.json` 后 `gates.json`），进程在两者之间被强杀（掉电、kill、OOM）
+会让闸门与事件状态短暂不一致。每次启动加载事件后，存储层会做一次**对账（reconcile）**，
+把闸门的自动阻塞强制对齐到本地事件的实际状态：
+
+- 闸门已阻塞：卡住的事件已投递（或事件记录缺失）→ 清除陈旧阻塞；仍在 `RETRY_WAIT`/`FAILED`
+  → 保留阻塞并刷新阻塞原因（如 `RETRY_WAIT:SERVER_ERROR`、`FAILED:CLIENT_REJECTED`）；
+  `LEASED`/`PENDING`（重试进行中或已被重放）→ 阻塞仍然有效，原样保留。
+- 闸门未阻塞：聚合内存在未处理完（`RETRY_WAIT`/`FAILED`）的事件 → 按序号最小者补回阻塞。
+- 对账只影响自动阻塞，不影响人工暂停；且是幂等的——同一份本地状态反复重启，恢复出的闸门、
+  排队数完全一致，已生效事件不会因此被重复投递，排队件数不增不减。
+- 兜底：认领阶段计算队首时把 `FAILED` 也视为“未处理完”，即使闸门记录缺失，
+  彻底失败的队首也会挡住后面的事件，一件都不许越过。
+- 对账结果会打日志（`gate reconcile done restoredBlocks=… clearedStaleBlocks=…`），不含敏感信息。
 
 ## 租户隔离与凭据保护
 
@@ -141,7 +160,7 @@
 | max-attempts | 5 | 最大尝试次数（含首次） |
 | max-pending | 10000 | 全局待投递数量上限 |
 | gate-max-queued-per-aggregate | 1000 | 被暂停/阻塞的单个聚合排队事件上限 |
-| gate-overflow-policy | REJECT | 聚合排队到顶策略：REJECT 拒绝（429 GATE_CAPACITY_EXCEEDED）/ DEFER 推迟接收 |
+| gate-overflow-policy | REJECT | 聚合排队到顶策略：REJECT 拒绝（429 GATE_CAPACITY_EXCEEDED）/ DEFER 推迟接收（429 GATE_CAPACITY_DEFERRED + Retry-After） |
 | claim-batch-size | 32 | 单次认领批量上限 |
 | poll-interval | 100ms | 工作线程扫描间隔 |
 
@@ -152,7 +171,8 @@
 - `POST /api/events/{id}/replay` → 重放 FAILED 事件（非 FAILED 返回 `409 EVENT_NOT_REPLAYABLE`）
 - `PUT /api/gates/{tenantId}/{aggregateKey}/pause` / `/resume` → 聚合闸门暂停 / 恢复
 - `GET /api/gates/{tenantId}/{aggregateKey}` / `GET /api/gates/{tenantId}` → 闸门与排队查询
-- 跨租户闸门操作 → `403 TENANT_FORBIDDEN`；聚合排队到顶（REJECT）→ `429 GATE_CAPACITY_EXCEEDED`
+- 跨租户闸门操作 → `403 TENANT_FORBIDDEN`；聚合排队到顶（REJECT)→ `429 GATE_CAPACITY_EXCEEDED`；
+  到顶推迟（DEFER）→ `429 GATE_CAPACITY_DEFERRED` + `Retry-After`
 
 ## 本地验证
 
@@ -174,8 +194,9 @@ mvn test
 | GatePauseResumeTests | 暂停期间不投递且不影响其它租户/聚合、恢复后按序继续、跨租户操作 403 |
 | GateBlockingTests | 重试中/彻底失败自动阻塞与排队查询、重放后按序放行、暂停+重放+恢复交织顺序 |
 | GateCapacityTests | 排队到顶 REJECT（429 GATE_CAPACITY_EXCEEDED，与全局背压可区分） |
-| GateDeferPolicyTests | DEFER 策略到顶仍接收，恢复后按序投递 |
+| GateDeferPolicyTests | DEFER 策略到顶推迟接收（429 GATE_CAPACITY_DEFERRED + Retry-After），闸门打开后重试成功、按序投递 |
 | GateRestartRecoveryTests | 重启后暂停/阻塞/积压恢复，不重复投递、不跳号 |
+| GateCrashRecoveryTests | 落状态中途被强杀后的重启对账：丢失的阻塞补回、陈旧阻塞清除、FAILED 队首挡住后续事件、反复重启结果一致 |
 
 回环接收端 `/receiver/{mode}`：`ok` / `timeout` / `server-error` / `reject` / `flaky` / `switchable`
 （`switchable` 初始拒绝、测试中途可切回正常接收，用于阻塞后重放场景），
@@ -198,4 +219,47 @@ curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/
 curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/$AGG/resume
 # 跨租户操作被拒绝：403 TENANT_FORBIDDEN
 curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-b/$AGG/pause
+```
+
+### 手动验证：中断/重启后的阻塞恢复
+
+```bash
+# 1. 造出一个被阻塞的聚合：让接收端永久拒绝（reject 模式返回 4xx）
+curl -s -H "X-Api-Key: token-a-secret" -H "Content-Type: application/json" \
+  -d '{"idempotencyKey":"c1","aggregateKey":"agg-crash","payload":"p1","targetUrl":"http://localhost:8080/receiver/reject"}' \
+  http://localhost:8080/api/events
+curl -s -H "X-Api-Key: token-a-secret" -H "Content-Type: application/json" \
+  -d '{"idempotencyKey":"c2","aggregateKey":"agg-crash","payload":"p2","targetUrl":"http://localhost:8080/receiver/ok"}' \
+  http://localhost:8080/api/events
+# 等 c1 进入 FAILED 后，闸门应为 BLOCKED（blockedEventId=c1 的事件 id，reason=FAILED:CLIENT_REJECTED）
+curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-crash
+
+# 2. 直接 kill -9 掉进程（模拟掉电/OOM），然后重启
+kill -9 <pid>
+mvn spring-boot:run &
+
+# 3. 重启后再查：闸门仍是 BLOCKED，卡住的事件/原因/排队数与重启前一致，
+#    c2 不会被投递（接收端 recorded 里看不到 p2）；反复重启结果不变
+curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-crash
+curl -s http://localhost:8080/receiver/recorded
+
+# 4. 重放卡住的事件后闸门自动放行，c2 按序接着投递
+curl -s -XPOST -H "X-Api-Key: token-a-secret" http://localhost:8080/api/events/<c1事件id>/replay
+```
+
+### 手动验证：排队上限与到顶策略
+
+```bash
+# 以小上限 + DEFER 策略启动
+mvn spring-boot:run -Dspring-boot.run.arguments="--delivery.gate-max-queued-per-aggregate=2 --delivery.gate-overflow-policy=DEFER" &
+curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-cap/pause
+# 前 2 件 202；第 3 件起到顶：429 GATE_CAPACITY_DEFERRED 且带 Retry-After 头（REJECT 策略则为 429 GATE_CAPACITY_EXCEEDED）
+for i in 1 2 3 4; do
+  curl -s -i -H "X-Api-Key: token-a-secret" -H "Content-Type: application/json" \
+    -d '{"idempotencyKey":"cap'$i'","aggregateKey":"agg-cap","payload":"p'$i'","targetUrl":"http://localhost:8080/receiver/ok"}' \
+    http://localhost:8080/api/events | head -1
+done
+# 闸门查询可见 queuedCount 停在 2，不再增长；恢复闸门后重试被推迟的提交即可按序投递
+curl -s -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-cap
+curl -s -XPUT -H "X-Api-Key: token-a-secret" http://localhost:8080/api/gates/tenant-a/agg-cap/resume
 ```

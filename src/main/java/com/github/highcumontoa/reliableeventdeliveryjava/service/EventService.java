@@ -52,6 +52,8 @@ public class EventService {
                     "pending event limit reached");
             case GATE_OVERFLOW -> throw new ApiException(ErrorCode.GATE_CAPACITY_EXCEEDED, 429,
                     "gated aggregate queued event limit reached");
+            case GATE_DEFERRED -> throw new ApiException(ErrorCode.GATE_CAPACITY_DEFERRED, 429,
+                    "gated aggregate queued event limit reached, retry later", 1);
             default -> throw new ApiException(ErrorCode.INTERNAL_ERROR, 500, "unexpected submit result");
         }
     }

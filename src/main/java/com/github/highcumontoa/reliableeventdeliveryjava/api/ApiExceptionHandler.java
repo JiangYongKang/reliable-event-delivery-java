@@ -16,8 +16,11 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException e) {
-        return ResponseEntity.status(e.getHttpStatus())
-                .body(new ErrorResponse(e.getCode().name(), e.getMessage()));
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(e.getHttpStatus());
+        if (e.getRetryAfterSeconds() != null) {
+            builder = builder.header("Retry-After", String.valueOf(e.getRetryAfterSeconds()));
+        }
+        return builder.body(new ErrorResponse(e.getCode().name(), e.getMessage()));
     }
 
     @ExceptionHandler(Exception.class)

@@ -74,21 +74,84 @@ public class FileEventStore implements EventStore {
     void load() {
         lock.lock();
         try {
-            if (!Files.exists(storeFile)) {
-                return;
+            if (Files.exists(storeFile)) {
+                DeliveryEvent[] events = mapper.readValue(storeFile.toFile(), DeliveryEvent[].class);
+                for (DeliveryEvent e : events) {
+                    byId.put(e.getId(), e);
+                    idemIndex.put(idemKey(e.getTenantId(), e.getIdempotencyKey()), e.getId());
+                    aggSeq.merge(aggKey(e.getTenantId(), e.getAggregateKey()), e.getSequence(), Math::max);
+                }
+                log.info("store loaded file={} events={}", storeFile, byId.size());
             }
-            DeliveryEvent[] events = mapper.readValue(storeFile.toFile(), DeliveryEvent[].class);
-            for (DeliveryEvent e : events) {
-                byId.put(e.getId(), e);
-                idemIndex.put(idemKey(e.getTenantId(), e.getIdempotencyKey()), e.getId());
-                aggSeq.merge(aggKey(e.getTenantId(), e.getAggregateKey()), e.getSequence(), Math::max);
-            }
-            log.info("store loaded file={} events={}", storeFile, byId.size());
+            reconcileGatesLocked();
         } catch (IOException e) {
             throw new UncheckedIOException("failed to load event store " + storeFile, e);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 重启对账：闸门的自动阻塞状态必须与本地事件状态一致。
+     * 落状态（先写 events.json 再写 gates.json）中途被强杀时，闸门可能丢失阻塞、
+     * 留下陈旧阻塞或原因停留在上一跳，这里按事件实际状态对齐：
+     * - 闸门已阻塞：卡住的事件缺失或已投递 → 清除陈旧阻塞；仍在 RETRY_WAIT/FAILED →
+     *   保留并刷新阻塞原因；LEASED/PENDING（重试进行中或已重放）→ 阻塞仍然有效，原样保留。
+     * - 闸门未阻塞：聚合内存在未处理完（RETRY_WAIT/FAILED）的事件 → 补回阻塞，
+     *   卡住的是其中序号最小的事件。同一份本地状态反复重启对账结果一致（幂等）。
+     */
+    private void reconcileGatesLocked() {
+        Map<String, DeliveryEvent> blockers = new HashMap<>();
+        for (DeliveryEvent e : byId.values()) {
+            if (e.getStatus() == EventStatus.RETRY_WAIT || e.getStatus() == EventStatus.FAILED) {
+                blockers.merge(aggKey(e.getTenantId(), e.getAggregateKey()), e,
+                        (a, b) -> a.getSequence() <= b.getSequence() ? a : b);
+            }
+        }
+        int restored = 0;
+        int cleared = 0;
+        for (AggregateGate g : gateStore.listAll()) {
+            String key = aggKey(g.getTenantId(), g.getAggregateKey());
+            if (g.isBlocked()) {
+                DeliveryEvent blocked = byId.get(g.getBlockedEventId());
+                if (blocked == null || blocked.getStatus() == EventStatus.DELIVERED) {
+                    if (gateStore.reconcileBlock(g.getTenantId(), g.getAggregateKey(), null, null)) {
+                        cleared++;
+                    }
+                } else if (blocked.getStatus() == EventStatus.RETRY_WAIT
+                        || blocked.getStatus() == EventStatus.FAILED) {
+                    blockers.remove(key);
+                    if (gateStore.reconcileBlock(g.getTenantId(), g.getAggregateKey(),
+                            blocked.getId(), blockReasonOf(blocked))) {
+                        restored++;
+                    }
+                } else {
+                    blockers.remove(key);
+                }
+            } else {
+                DeliveryEvent blocker = blockers.remove(key);
+                if (blocker != null && gateStore.reconcileBlock(g.getTenantId(), g.getAggregateKey(),
+                        blocker.getId(), blockReasonOf(blocker))) {
+                    restored++;
+                }
+            }
+        }
+        // 闸门文件里完全没有记录、但事件状态要求阻塞的聚合（崩溃窗口丢失的阻塞）
+        for (DeliveryEvent blocker : blockers.values()) {
+            if (gateStore.reconcileBlock(blocker.getTenantId(), blocker.getAggregateKey(),
+                    blocker.getId(), blockReasonOf(blocker))) {
+                restored++;
+            }
+        }
+        if (restored > 0 || cleared > 0) {
+            log.info("gate reconcile done restoredBlocks={} clearedStaleBlocks={}", restored, cleared);
+        }
+    }
+
+    /** 由事件状态推导闸门阻塞原因，格式与运行时落状态一致：STATUS:FAILURE_KIND */
+    private static String blockReasonOf(DeliveryEvent e) {
+        String kind = e.getLastFailureKind() == null ? "UNKNOWN" : e.getLastFailureKind();
+        return e.getStatus().name() + ":" + kind;
     }
 
     @Override
@@ -107,13 +170,14 @@ public class FileEventStore implements EventStore {
             if (countPendingLocked() >= maxPending) {
                 return new SubmitResult(SubmitStatus.OVERLOAD, null);
             }
-            // 闸门关闭（暂停/阻塞）的聚合：排队到顶后按策略拒绝或推迟接收
+            // 闸门关闭（暂停/阻塞）的聚合：排队到顶后按策略拒绝或推迟接收，两种策略都不许越过上限
             AggregateGate gate = gateStore.snapshot(event.getTenantId(), event.getAggregateKey()).orElse(null);
             if (gate != null && (gate.isPaused() || gate.isBlocked())
                     && countQueuedForAggregateLocked(event.getTenantId(), event.getAggregateKey(), null)
-                            >= properties.getGateMaxQueuedPerAggregate()
-                    && properties.getGateOverflowPolicy() == OverflowPolicy.REJECT) {
-                return new SubmitResult(SubmitStatus.GATE_OVERFLOW, null);
+                            >= properties.getGateMaxQueuedPerAggregate()) {
+                return properties.getGateOverflowPolicy() == OverflowPolicy.REJECT
+                        ? new SubmitResult(SubmitStatus.GATE_OVERFLOW, null)
+                        : new SubmitResult(SubmitStatus.GATE_DEFERRED, null);
             }
             Instant now = Instant.now();
             String aggKey = aggKey(event.getTenantId(), event.getAggregateKey());
@@ -171,10 +235,11 @@ public class FileEventStore implements EventStore {
         lock.lock();
         try {
             Instant now = Instant.now();
-            // 每个聚合键的队首（最小 sequence 的非终态事件）
+            // 每个聚合键的队首（最小 sequence 的未投递事件；FAILED 也算未处理完，
+            // 即使闸门记录缺失，彻底失败的队首也会挡住后面的事件，不得越过）
             Map<String, DeliveryEvent> heads = new HashMap<>();
             for (DeliveryEvent e : byId.values()) {
-                if (e.getStatus() == EventStatus.DELIVERED || e.getStatus() == EventStatus.FAILED) {
+                if (e.getStatus() == EventStatus.DELIVERED) {
                     continue;
                 }
                 String key = aggKey(e.getTenantId(), e.getAggregateKey());
@@ -228,6 +293,7 @@ public class FileEventStore implements EventStore {
             e.setLeaseOwner(null);
             e.setLeaseExpiresAt(null);
             e.setLastError(null);
+            e.setLastFailureKind(null);
             e.setUpdatedAt(Instant.now());
             persistLocked();
             // 卡住本聚合的事件投递成功：自动放行闸门，后续事件按序继续
@@ -253,6 +319,7 @@ public class FileEventStore implements EventStore {
             e.setLeaseOwner(null);
             e.setLeaseExpiresAt(null);
             e.setLastError(sanitize(error));
+            e.setLastFailureKind(failureKind);
             e.setUpdatedAt(Instant.now());
             persistLocked();
             // 还有事件没处理完（等下次重试）：聚合自动进入阻塞，后续事件排队
@@ -276,6 +343,7 @@ public class FileEventStore implements EventStore {
             e.setLeaseOwner(null);
             e.setLeaseExpiresAt(null);
             e.setLastError(sanitize(error));
+            e.setLastFailureKind(failureKind);
             e.setUpdatedAt(Instant.now());
             persistLocked();
             // 彻底失败：聚合自动进入阻塞，后续事件排队等待人工重放
@@ -299,6 +367,7 @@ public class FileEventStore implements EventStore {
             e.setNextAttemptAt(Instant.now());
             e.setLeaseOwner(null);
             e.setLeaseExpiresAt(null);
+            e.setLastFailureKind(null);
             e.setUpdatedAt(Instant.now());
             persistLocked();
             return true;
@@ -441,6 +510,7 @@ public class FileEventStore implements EventStore {
         c.setCreatedAt(e.getCreatedAt());
         c.setUpdatedAt(e.getUpdatedAt());
         c.setLastError(e.getLastError());
+        c.setLastFailureKind(e.getLastFailureKind());
         return c;
     }
 }

@@ -28,7 +28,7 @@ public class DeliveryProperties {
     private Duration pollInterval = Duration.ofMillis(100);
     /** 被暂停/阻塞的单个聚合允许累积的排队事件上限，到顶按 gate-overflow-policy 处理 */
     private int gateMaxQueuedPerAggregate = 1000;
-    /** 闸门聚合排队到顶时的策略：REJECT 拒绝 / DEFER 推迟接收 */
+    /** 闸门聚合排队到顶时的策略：REJECT 拒绝（429 GATE_CAPACITY_EXCEEDED）/ DEFER 推迟接收（429 GATE_CAPACITY_DEFERRED + Retry-After） */
     private OverflowPolicy gateOverflowPolicy = OverflowPolicy.REJECT;
 
     public String getStorageDir() { return storageDir; }
